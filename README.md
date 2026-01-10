@@ -12,6 +12,11 @@ Refer to the preprint and the [project repository](https://github.com/YosefLab/c
 pip install csde
 ```
 
+By default, this installs JAX with CPU support. To enable GPU support (CUDA), install with the appropriate extra (e.g., for CUDA 12):
+```bash
+pip install "csde[cuda12]"
+```
+
 ## Data Requirements
 
 `csde` requires two `AnnData` objects containing gene expression counts. Typically, these are obtained by splitting your full dataset into two groups:

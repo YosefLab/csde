@@ -33,6 +33,8 @@ dev = [
     "isort",
     "flake8",
 ]
+cuda12 = ["jax[cuda12]"]
+cuda13 = ["jax[cuda13]"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
