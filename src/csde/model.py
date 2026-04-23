@@ -176,12 +176,15 @@ class RegressionInterceptModel(nn.Module):
             "mu", nn.initializers.normal(), (self.n_classes - 1, self.n_features)
         )
 
-    def __call__(self, x, y):
+    def __call__(self, x, y, w=None):
         y_ = y.astype(jnp.int32)
         mu_placeholder = jnp.zeros_like(self.mu0)
         mu = jnp.concatenate([mu_placeholder[None], self.mu], axis=0)
         y_oh = jnp.eye(self.n_classes)[y_]
         mus_ = y_oh @ mu + self.mu0
+
+        if w is None:
+            w = jnp.ones_like(y, dtype=jnp.float64)
 
         if self.family == "poisson":
             rates = jnp.exp(mus_)
@@ -195,8 +198,8 @@ class RegressionInterceptModel(nn.Module):
 
         loss = -log_px_c
         return {
-            "loss": loss,
-            "loss_unsummed": -log_px_c_unsummed,
+            "loss": loss * w,
+            "loss_unsummed": -log_px_c_unsummed * w[..., None],
         }
 
 
@@ -212,6 +215,7 @@ class InterceptRegression(PPIAbstractClass):
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
         family: str = "poisson",
         jit: bool = True,
+        importance_weights: Optional[np.ndarray] = None,
         **kwargs,
     ):
         """
@@ -223,6 +227,8 @@ class InterceptRegression(PPIAbstractClass):
             optimizer_kwargs: Keyword arguments for the optimizer.
             family: Distribution family ('poisson' or 'gaussian').
             jit: Whether to JIT compile the optimization.
+            importance_weights: Optional 1-D array of importance weights for the ground-truth
+                observations. Will be normalized to sum to n_obs.
             **kwargs: Arguments passed to PPIAbstractClass (inputs_gt, inputs_hat, inputs_unl).
         """
         super().__init__(**kwargs)
@@ -239,6 +245,19 @@ class InterceptRegression(PPIAbstractClass):
         self.inputs_gt = (x_gt, y_gt)
         self.inputs_hat = (x_hat, y_hat)
         self.inputs_unl = (x_unl, y_unl)
+
+        if importance_weights is not None:
+            if importance_weights.shape != (x_gt.shape[0],):
+                raise ValueError(
+                    "importance_weights must be a 1-D array with the same length "
+                    "as the number of ground-truth observations"
+                )
+            # Normalize so weights sum to n_obs
+            w = float(x_gt.shape[0]) * importance_weights / importance_weights.sum()
+            self.importance_weights = w
+        else:
+            self.importance_weights = None
+
         n_obs_real = x_gt.shape[0]
 
         self.n_features = x_gt.shape[1]
@@ -294,13 +313,13 @@ class InterceptRegression(PPIAbstractClass):
         self.theta = self.get_pointestimate(lambd_=lambd_0)
         print("done")
 
-        hess = self.hessian_fn(self.inputs_gt)
+        hess = self.hessian_fn(self.inputs_gt, importance_weights=self.importance_weights)
 
         inv_hess = np.linalg.pinv(hess)
         grad_f_unl = self.grad_fn(self.inputs_unl)
-        grad_f_hat = self.grad_fn(self.inputs_hat)
+        grad_f_hat = self.grad_fn(self.inputs_hat, w=self.importance_weights)
         grad_f_all = np.vstack([grad_f_hat, grad_f_unl])
-        grad_f_gt = self.grad_fn(self.inputs_gt)
+        grad_f_gt = self.grad_fn(self.inputs_gt, w=self.importance_weights)
 
         grad_f_hat_ = grad_f_hat - grad_f_hat.mean(0)
         grad_f_gt_ = grad_f_gt - grad_f_gt.mean(0)
@@ -402,21 +421,22 @@ class InterceptRegression(PPIAbstractClass):
         return self._compute_sigma(hess, v, self.n)
 
     def grad_fn(
-        self, inputs: Tuple[np.ndarray, np.ndarray], batch_size: int = 128
+        self, inputs: Tuple[np.ndarray, np.ndarray], w: Optional[np.ndarray] = None, batch_size: int = 128
     ) -> np.ndarray:
         x, y = inputs
         n_obs = x.shape[0]
 
-        def likelihood(model_params, x, y):
-            return self.model.apply(model_params, x, y)["loss"]
+        def likelihood(model_params, x, y, w=None):
+            return self.model.apply(model_params, x, y, w=w)["loss"]
 
+        score = self.jit(jax.jacfwd(likelihood))
         all_grads = np.zeros((n_obs, self.n_params))
         for i in tqdm(range(0, n_obs, batch_size), desc="Gradient computation"):
             x_batch = x[i:i+batch_size]
             y_batch = y[i:i+batch_size]
+            w_batch = w[i:i+batch_size] if w is not None else None
             n_obs_batch = x_batch.shape[0]
-            score = self.jit(jax.jacfwd(likelihood))
-            grads = score(self.model_params, x_batch, y_batch)
+            grads = score(self.model_params, x_batch, y_batch, w=w_batch)
             grad_mu = np.array(grads["params"]["mu"].reshape(n_obs_batch, -1))
             grad_mu0 = np.array(grads["params"]["mu0"].reshape(n_obs_batch, -1))
             all_grads[i:i+batch_size] = np.hstack([grad_mu, grad_mu0])
@@ -541,7 +561,7 @@ class InterceptRegression(PPIAbstractClass):
         self.model_params = params
 
     def hessian_fn(
-        self, inputs: Tuple[np.ndarray, np.ndarray], device=None
+        self, inputs: Tuple[np.ndarray, np.ndarray], importance_weights: Optional[np.ndarray] = None, device=None
     ) -> np.ndarray:
         x, y = inputs
 
@@ -552,13 +572,13 @@ class InterceptRegression(PPIAbstractClass):
         obs_ids = np.arange(n_obs)
         model_ = self.model
 
-        def likelihood(model_params, x, y):
-            return model_.apply(model_params, x, y)["loss"]
+        def likelihood(model_params, x, y, w=None):
+            return model_.apply(model_params, x, y, w=w)["loss"]
 
         hess_fn = jax.hessian(likelihood)
 
-        def process_hess(x, y):
-            hess_ = hess_fn(model_params_, x, y)
+        def process_hess(x, y, w=None):
+            hess_ = hess_fn(model_params_, x, y, w=w)
             mu_mu = (
                 hess_["params"]["mu"]["params"]["mu"]
                 .mean(0)
@@ -591,6 +611,11 @@ class InterceptRegression(PPIAbstractClass):
             y_ = jnp.array(y[[obs_id]], dtype=jnp.int32)
             x_obs = jax.device_put(x_, device)
             y_obs = jax.device_put(y_, device)
-            hess_ = process_hess(x_obs, y_obs)
+            if importance_weights is not None:
+                w_ = jnp.array(importance_weights[[obs_id]], dtype=jnp.float64)
+                w_obs = jax.device_put(w_, device)
+            else:
+                w_obs = None
+            hess_ = process_hess(x_obs, y_obs, w_obs)
             hessian += hess_ / float(n_obs)
         return hessian
