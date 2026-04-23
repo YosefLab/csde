@@ -1,5 +1,7 @@
 # CSDE: Corrected Spatial Differential Expression
 
+[![Tests](https://github.com/YosefLab/csde/actions/workflows/test.yml/badge.svg)](https://github.com/YosefLab/csde/actions/workflows/test.yml)
+
 `csde` (Corrected Spatial Differential Expression) is a Python package designed to **identify differentially expressed (DE) genes between spatially-resolved cell populations** (e.g., T-cells inside vs. outside a tumor).
 
 Standard analysis relies on cell population assignments (e.g., "infiltrating" vs. "non-infiltrating") obtained automatically from clustering/ML that are often prone to errors. `csde` corrects for these inaccuracies by leveraging a small subset of validated "ground-truth" data, providing rigorous statistical guarantees for spatially-resolved DE analyses.

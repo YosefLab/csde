@@ -1,10 +1,7 @@
-import os
-from typing import Union, Optional, Tuple, List, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import flax.linen as nn
 import jax
-
-jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
@@ -13,6 +10,8 @@ from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 
 from csde.optimization import _zstat_generic2, optimize_ppi, optimize_ppi_gd
+
+jax.config.update("jax_enable_x64", True)
 
 
 class PPIAbstractClass:
@@ -413,14 +412,14 @@ class InterceptRegression(PPIAbstractClass):
 
         all_grads = np.zeros((n_obs, self.n_params))
         for i in tqdm(range(0, n_obs, batch_size), desc="Gradient computation"):
-            x_batch = x[i : i + batch_size]
-            y_batch = y[i : i + batch_size]
+            x_batch = x[i:i+batch_size]
+            y_batch = y[i:i+batch_size]
             n_obs_batch = x_batch.shape[0]
             score = self.jit(jax.jacfwd(likelihood))
             grads = score(self.model_params, x_batch, y_batch)
             grad_mu = np.array(grads["params"]["mu"].reshape(n_obs_batch, -1))
             grad_mu0 = np.array(grads["params"]["mu0"].reshape(n_obs_batch, -1))
-            all_grads[i : i + batch_size] = np.hstack([grad_mu, grad_mu0])
+            all_grads[i:i+batch_size] = np.hstack([grad_mu, grad_mu0])
         return np.array(all_grads)
 
     def _construct_contrast(self, feature_id: int, idx_a: int) -> np.ndarray:

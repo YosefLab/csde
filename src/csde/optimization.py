@@ -1,5 +1,5 @@
 import time
-from typing import Optional, Callable, Dict, Any, Tuple
+from typing import Any, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
