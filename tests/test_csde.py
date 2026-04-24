@@ -1,7 +1,9 @@
 import unittest
+
+import anndata
 import numpy as np
 import pandas as pd
-import anndata
+
 from csde import run_csde
 
 
@@ -78,9 +80,11 @@ class TestCSDE(unittest.TestCase):
         self.assertTrue(not res.isnull().values.any())
 
     def test_importance_weights_wrong_shape(self):
-        from csde.model import InterceptRegression
+        from csde.model_poisson import PoissonIntercept as InterceptRegression
 
-        x_gt, y_gt = self.adata_gt.X.astype(float), np.zeros(len(self.adata_gt), dtype=int)
+        x_gt, y_gt = self.adata_gt.X.astype(float), np.zeros(
+            len(self.adata_gt), dtype=int
+        )
         x_hat = x_gt.copy()
         x_unl = self.adata_pred.X.astype(float)
         y_hat = np.zeros(len(self.adata_gt), dtype=int)
