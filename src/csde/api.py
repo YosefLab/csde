@@ -4,7 +4,7 @@ import anndata
 import numpy as np
 import pandas as pd
 
-from csde.model import InterceptRegression
+from csde.model_poisson import PoissonIntercept
 
 
 def _map_cell_types(
@@ -45,6 +45,7 @@ def run_csde(
     cell_pop_b: str,
     gt_key: str,
     layer_name: Optional[str] = None,
+    importance_weights: Optional[np.ndarray] = None,
     **model_kwargs,
 ) -> pd.DataFrame:
     """
@@ -61,7 +62,9 @@ def run_csde(
         cell_pop_b: Name of the second cell population (target group).
         gt_key: Boolean column in adata_gt.obs indicating if the prediction is correct.
         layer_name: Layer in adata.layers to use for expression counts. If None, uses .X.
-        **model_kwargs: Additional arguments passed to InterceptRegression (e.g., family, optimizer).
+        importance_weights: Optional 1-D array of importance weights for the ground-truth
+            observations. Will be normalized to sum to n_obs internally.
+        **model_kwargs: Additional arguments passed to PoissonIntercept (e.g., optimizer).
 
     Returns:
         DataFrame indexed by gene names with columns:
@@ -106,10 +109,11 @@ def run_csde(
     inputs_unl = (X_unl, y_pred_unl)
 
     # inference
-    model = InterceptRegression(
+    model = PoissonIntercept(
         inputs_gt=inputs_gt,
         inputs_hat=inputs_hat,
         inputs_unl=inputs_unl,
+        importance_weights=importance_weights,
         **model_kwargs,
     )
     model.fit(lambd_=None)

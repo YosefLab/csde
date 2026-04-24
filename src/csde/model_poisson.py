@@ -5,170 +5,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
-from numpyro.distributions import Normal, Poisson
+from numpyro.distributions import Poisson
 from statsmodels.stats.multitest import multipletests
 from tqdm import tqdm
 
+from csde._base import PPIAbstractClass
 from csde.optimization import _zstat_generic2, optimize_ppi, optimize_ppi_gd
 
-jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_x64", False)
 
 
-class PPIAbstractClass:
-    """
-    Abstract base class for Prediction-Powered Inference (PPI) models.
-    """
-
-    def __init__(
-        self,
-        inputs_gt: Union[Tuple[np.ndarray, np.ndarray], np.ndarray],
-        inputs_hat: Union[Tuple[np.ndarray, np.ndarray], np.ndarray],
-        inputs_unl: Union[Tuple[np.ndarray, np.ndarray], np.ndarray],
-        lambd_mode: str = "overall",
-    ):
-        """
-        Initialize the PPI model.
-
-        Args:
-            inputs_gt: Ground truth data (features, labels).
-            inputs_hat: Predicted data for the labeled set (features, predicted labels).
-            inputs_unl: Unlabeled data (features, predicted labels).
-            lambd_mode: Mode for lambda parameter ('overall' or 'element').
-        """
-        self.inputs_gt = inputs_gt
-        self.inputs_hat = inputs_hat
-        self.inputs_unl = inputs_unl
-
-        inputs_are_tuples = isinstance(inputs_gt, tuple)
-        if inputs_are_tuples:
-            self.n = inputs_gt[0].shape[0]
-            self.N = inputs_unl[0].shape[0]
-        else:
-            self.n = self.inputs_gt.shape[0]
-            self.N = self.inputs_unl.shape[0]
-        self.r = float(self.n) / self.N
-        self.theta = None
-        self.sigma = None
-        self.hessian = None
-        self.v = None
-        self.lambd_mode = lambd_mode
-        self.lambd_ = None
-
-    def get_asymptotic_distribution(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute the asymptotic distribution of the estimator.
-
-        Returns:
-            Tuple containing the point estimate (theta) and the covariance matrix (sigma).
-        """
-        self.sigma = self.compute_sigma(self.lambd_)
-        return self.theta, self.sigma
-
-    def compute_sigma(self, lambd: Union[float, np.ndarray]) -> np.ndarray:
-        """
-        Compute the covariance matrix of the estimator.
-        """
-        grad_f_unl = self.grad_fn(self.inputs_unl)
-        grad_f_hat = self.grad_fn(self.inputs_hat)
-        grad_f_all = np.vstack([grad_f_hat, grad_f_unl])
-        grad_f_gt = self.grad_fn(self.inputs_gt)
-
-        grad_f_ = grad_f_all - grad_f_all.mean(axis=0)
-
-        # Handle lambda broadcasting if necessary
-        if self.lambd_mode == "element" and isinstance(lambd, np.ndarray):
-            # This part was implementation specific in subclass, but generalized here based on pattern
-            # Assuming lambd matches gradient dimensions or is handled in subclass override
-            pass
-
-        # Base implementation for scalar lambda, override in subclass if needed
-        vf = (lambd**2) * (grad_f_.T @ grad_f_) / (self.n + self.N)
-        rect_ = grad_f_gt - lambd * grad_f_hat
-        rect_ = rect_ - rect_.mean(axis=0)
-        vdelta = (rect_.T @ rect_) / self.n
-        v = vdelta + (self.r * vf)
-
-        hess = self.hessian_fn(self.inputs_gt)
-        self.hessian = hess
-        self.v = v
-        return self._compute_sigma(hess, v, self.n)
-
-    @staticmethod
-    def _compute_sigma(hess: np.ndarray, v: np.ndarray, n: int) -> np.ndarray:
-        """
-        Compute the asymptotic covariance matrix of the parameter estimates.
-        """
-        inv_hess = np.linalg.pinv(hess)
-        sigma_ = inv_hess @ v @ inv_hess
-        sigma_ = sigma_ / n
-        return sigma_
-
-    def get_lambda(
-        self,
-        lambd_0: float = 0.5,
-        idx_to_optimize: Optional[Union[int, List[int]]] = None,
-    ) -> Union[float, np.ndarray]:
-        """
-        Estimate the optimal lambda parameter.
-        """
-        print("get point estimate ...")
-        self.theta = self.get_pointestimate(lambd_=lambd_0)
-        print("done")
-
-        hess = self.hessian_fn(self.inputs_gt)
-
-        inv_hess = np.linalg.pinv(hess)
-        grad_f_unl = self.grad_fn(self.inputs_unl)
-        grad_f_hat = self.grad_fn(self.inputs_hat)
-        grad_f_all = np.vstack([grad_f_hat, grad_f_unl])
-        grad_f_gt = self.grad_fn(self.inputs_gt)
-
-        grad_f_hat_ = grad_f_hat - grad_f_hat.mean(0)
-        grad_f_gt_ = grad_f_gt - grad_f_gt.mean(0)
-        cov1 = (grad_f_hat_.T @ grad_f_gt_) / self.n
-        cov2 = (grad_f_gt_.T @ grad_f_hat_) / self.n
-
-        grad_f_ = grad_f_all - grad_f_all.mean(axis=0)
-        vf = (grad_f_.T @ grad_f_) / (self.n + self.N)
-        num = inv_hess @ (cov1 + cov2) @ inv_hess
-        denom = 2 * (1.0 + self.r) * (inv_hess @ vf @ inv_hess)
-        if self.lambd_mode == "element":
-            lambd_star = num / denom
-            return np.diag(lambd_star)
-        elif idx_to_optimize is not None:
-            print("optimize lambda for a single theta comp.")
-            if isinstance(idx_to_optimize, int):
-                return (
-                    num[idx_to_optimize, idx_to_optimize]
-                    / denom[idx_to_optimize, idx_to_optimize]
-                )
-            else:
-                return np.trace(num[idx_to_optimize, :][:, idx_to_optimize]) / np.trace(
-                    denom[idx_to_optimize, :][:, idx_to_optimize]
-                )
-        else:
-            return np.trace(num) / np.trace(denom)
-
-    def get_pointestimate(self, lambd_: float) -> np.ndarray:
-        raise NotImplementedError
-
-    def grad_fn(self, inputs: Tuple[np.ndarray, np.ndarray]) -> np.ndarray:
-        raise NotImplementedError
-
-    def hessian_fn(self, inputs: Tuple[np.ndarray, np.ndarray]) -> np.ndarray:
-        raise NotImplementedError
-
-
-class RegressionInterceptModel(nn.Module):
-    """
-    Flax module for the intercept regression model.
-    """
-
+class PoissonInterceptModule(nn.Module):
     n_classes: int
     n_features: int
     mu_prior_std: Union[float, jnp.ndarray]
     n_obs_real: int
-    family: str
 
     def setup(self):
         self.mu0 = self.param("mu0", nn.initializers.normal(), (self.n_features))
@@ -176,55 +27,37 @@ class RegressionInterceptModel(nn.Module):
             "mu", nn.initializers.normal(), (self.n_classes - 1, self.n_features)
         )
 
-    def __call__(self, x, y):
+    def __call__(self, x, y, w=None):
         y_ = y.astype(jnp.int32)
         mu_placeholder = jnp.zeros_like(self.mu0)
         mu = jnp.concatenate([mu_placeholder[None], self.mu], axis=0)
         y_oh = jnp.eye(self.n_classes)[y_]
         mus_ = y_oh @ mu + self.mu0
 
-        if self.family == "poisson":
-            rates = jnp.exp(mus_)
-            log_px_c_unsummed = Poisson(rate=rates).log_prob(x)
-            log_px_c = log_px_c_unsummed.sum(axis=-1)
-        elif self.family == "gaussian":
-            log_px_c_unsummed = Normal(loc=mus_, scale=1.0).log_prob(x)
-            log_px_c = log_px_c_unsummed.sum(axis=-1)
-        else:
-            raise ValueError(f"Unknown family: {self.family}")
+        if w is None:
+            w = jnp.ones_like(y, dtype=jnp.float64)
+
+        rates = jnp.exp(mus_)
+        log_px_c_unsummed = Poisson(rate=rates).log_prob(x)
+        log_px_c = log_px_c_unsummed.sum(axis=-1)
 
         loss = -log_px_c
         return {
-            "loss": loss,
-            "loss_unsummed": -log_px_c_unsummed,
+            "loss": loss * w,
+            "loss_unsummed": -log_px_c_unsummed * w[..., None],
         }
 
 
-class InterceptRegression(PPIAbstractClass):
-    """
-    Intercept Regression model for spatial differential expression analysis.
-    """
-
+class PoissonIntercept(PPIAbstractClass):
     def __init__(
         self,
         mu_prior_std: Optional[Union[float, jnp.ndarray]] = None,
         optimizer: str = "gd",
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
-        family: str = "poisson",
         jit: bool = True,
+        importance_weights: Optional[np.ndarray] = None,
         **kwargs,
     ):
-        """
-        Initialize the InterceptRegression model.
-
-        Args:
-            mu_prior_std: Prior standard deviation for mu.
-            optimizer: Optimization method ('gd' or 'lbfgs').
-            optimizer_kwargs: Keyword arguments for the optimizer.
-            family: Distribution family ('poisson' or 'gaussian').
-            jit: Whether to JIT compile the optimization.
-            **kwargs: Arguments passed to PPIAbstractClass (inputs_gt, inputs_hat, inputs_unl).
-        """
         super().__init__(**kwargs)
 
         x_gt, y_gt = self.inputs_gt
@@ -239,16 +72,27 @@ class InterceptRegression(PPIAbstractClass):
         self.inputs_gt = (x_gt, y_gt)
         self.inputs_hat = (x_hat, y_hat)
         self.inputs_unl = (x_unl, y_unl)
+
+        if importance_weights is not None:
+            if importance_weights.shape != (x_gt.shape[0],):
+                raise ValueError(
+                    "importance_weights must be a 1-D array with the same length "
+                    "as the number of ground-truth observations"
+                )
+            w = float(x_gt.shape[0]) * importance_weights / importance_weights.sum()
+            self.importance_weights = w
+        else:
+            self.importance_weights = None
+
         n_obs_real = x_gt.shape[0]
 
         self.n_features = x_gt.shape[1]
         self.n_params = (self.n_classes - 1) * self.n_features + self.n_features
-        self.model = RegressionInterceptModel(
+        self.model = PoissonInterceptModule(
             n_classes=self.n_classes,
             n_features=self.n_features,
             mu_prior_std=mu_prior_std,
             n_obs_real=n_obs_real,
-            family=family,
         )
         self.model_params = None
 
@@ -262,13 +106,6 @@ class InterceptRegression(PPIAbstractClass):
     def fit(
         self, lambd_: Optional[Union[float, np.ndarray]] = None, refit: bool = False
     ):
-        """
-        Fit the model parameters.
-
-        Args:
-            lambd_: Lambda parameter. If None, it is estimated.
-            refit: Whether to re-initialize parameters before fitting.
-        """
         if lambd_ is None:
             lambd_ = self.get_lambda()
         print(f"lambda: {lambd_}")
@@ -282,25 +119,18 @@ class InterceptRegression(PPIAbstractClass):
         lambd_0: float = 0.5,
         idx_to_optimize: Optional[Union[int, List[int]]] = None,
     ) -> Union[float, np.ndarray]:
-        """
-        Estimate the optimal lambda parameter.
-        Overriding parent method to handle element-wise lambda specific logic.
-        """
-        # Call parent to get num and denom matrices/values if needed, but the parent implementation
-        # might need access to _construct_contrast for element-wise which is specific to this class.
-        # So copying logic from original implementation to be safe and consistent.
-
         print("get point estimate ...")
         self.theta = self.get_pointestimate(lambd_=lambd_0)
         print("done")
 
-        hess = self.hessian_fn(self.inputs_gt)
-
+        hess = self.hessian_fn(
+            self.inputs_gt, importance_weights=self.importance_weights
+        )
         inv_hess = np.linalg.pinv(hess)
         grad_f_unl = self.grad_fn(self.inputs_unl)
-        grad_f_hat = self.grad_fn(self.inputs_hat)
+        grad_f_hat = self.grad_fn(self.inputs_hat, w=self.importance_weights)
         grad_f_all = np.vstack([grad_f_hat, grad_f_unl])
-        grad_f_gt = self.grad_fn(self.inputs_gt)
+        grad_f_gt = self.grad_fn(self.inputs_gt, w=self.importance_weights)
 
         grad_f_hat_ = grad_f_hat - grad_f_hat.mean(0)
         grad_f_gt_ = grad_f_gt - grad_f_gt.mean(0)
@@ -342,6 +172,7 @@ class InterceptRegression(PPIAbstractClass):
 
         model_params0 = self.model_params if self.model_params is not None else None
         if self.optimizer == "lbfgs":
+            print("optimize with lbfgs")
             model_params = optimize_ppi(
                 self.model,
                 lambd_=lambd_,
@@ -355,6 +186,7 @@ class InterceptRegression(PPIAbstractClass):
                 **self.optimizer_kwargs,
             )
         elif self.optimizer == "gd":
+            print("optimize with gd")
             model_params = optimize_ppi_gd(
                 self.model,
                 lambd_=lambd_,
@@ -377,11 +209,10 @@ class InterceptRegression(PPIAbstractClass):
         return np.hstack([mu, mu0])
 
     def compute_sigma(self, lambd: Union[float, np.ndarray]) -> np.ndarray:
-        # Override to handle element-wise lambda and specific broadcasting
         grad_f_unl = self.grad_fn(self.inputs_unl)
-        grad_f_hat = self.grad_fn(self.inputs_hat)
+        grad_f_hat = self.grad_fn(self.inputs_hat, w=self.importance_weights)
         grad_f_all = np.vstack([grad_f_hat, grad_f_unl])
-        grad_f_gt = self.grad_fn(self.inputs_gt)
+        grad_f_gt = self.grad_fn(self.inputs_gt, w=self.importance_weights)
 
         grad_f_ = grad_f_all - grad_f_all.mean(axis=0)
         if self.lambd_mode == "element":
@@ -396,36 +227,41 @@ class InterceptRegression(PPIAbstractClass):
         vdelta = (rect_.T @ rect_) / self.n
         v = vdelta + (self.r * vf)
 
-        hess = self.hessian_fn(self.inputs_gt)
+        hess = self.hessian_fn(
+            self.inputs_gt, importance_weights=self.importance_weights
+        )
         self.hessian = hess
         self.v = v
         return self._compute_sigma(hess, v, self.n)
 
     def grad_fn(
-        self, inputs: Tuple[np.ndarray, np.ndarray], batch_size: int = 128
+        self,
+        inputs: Tuple[np.ndarray, np.ndarray],
+        w: Optional[np.ndarray] = None,
+        batch_size: int = 128,
     ) -> np.ndarray:
         x, y = inputs
         n_obs = x.shape[0]
 
-        def likelihood(model_params, x, y):
-            return self.model.apply(model_params, x, y)["loss"]
+        def likelihood(model_params, x, y, w=None):
+            return self.model.apply(model_params, x, y, w=w)["loss"]
 
+        score = self.jit(jax.jacfwd(likelihood))
         all_grads = np.zeros((n_obs, self.n_params))
         for i in tqdm(range(0, n_obs, batch_size), desc="Gradient computation"):
-            x_batch = x[i:i+batch_size]
-            y_batch = y[i:i+batch_size]
+            x_batch = x[i : i + batch_size]
+            y_batch = y[i : i + batch_size]
+            w_batch = w[i : i + batch_size] if w is not None else None
             n_obs_batch = x_batch.shape[0]
-            score = self.jit(jax.jacfwd(likelihood))
-            grads = score(self.model_params, x_batch, y_batch)
+            grads = score(self.model_params, x_batch, y_batch, w=w_batch)
             grad_mu = np.array(grads["params"]["mu"].reshape(n_obs_batch, -1))
             grad_mu0 = np.array(grads["params"]["mu0"].reshape(n_obs_batch, -1))
-            all_grads[i:i+batch_size] = np.hstack([grad_mu, grad_mu0])
+            all_grads[i : i + batch_size] = np.hstack([grad_mu, grad_mu0])
         return np.array(all_grads)
 
     def _construct_contrast(self, feature_id: int, idx_a: int) -> np.ndarray:
         mu_contrast = np.zeros((self.n_classes - 1, self.n_features))
         mu_contrast[idx_a - 1, feature_id] = 1.0
-
         mu0_contrast = np.zeros(self.n_features)
         contrast = np.hstack([mu_contrast.flatten(), mu0_contrast])
         return contrast.astype(int)
@@ -433,7 +269,6 @@ class InterceptRegression(PPIAbstractClass):
     def idx_to_feat(self) -> np.ndarray:
         mu_identifier = np.ones((self.n_classes - 1, self.n_features))
         mu_identifier = mu_identifier * np.arange(self.n_features)
-
         mu0_identifier = np.arange(self.n_features)
         identifier = np.hstack([mu_identifier.flatten(), mu0_identifier])
         return identifier.astype(int)
@@ -443,13 +278,11 @@ class InterceptRegression(PPIAbstractClass):
             self._construct_contrast(feature_id, idx_a)
             for feature_id in range(self.n_features)
         ]
-        _contrast = np.vstack(_contrast)
-        return _contrast
+        return np.vstack(_contrast)
 
     def get_beta(self, idx_a: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if idx_a == 0:
             raise ValueError("`class_a` cannot be the reference class.")
-
         contrast = self.construct_contrast(idx_a)
         beta = contrast @ self.theta
         cov = contrast @ self.sigma @ contrast.T
@@ -473,8 +306,7 @@ class InterceptRegression(PPIAbstractClass):
             for class_id in range(1, self.n_classes)
         ]
         mu0_indices = [self._get_param_id(feature_id=feature_id, param_type="mu0")]
-        indices_to_keep = np.hstack([mu_indices, mu0_indices])
-        return indices_to_keep
+        return np.hstack([mu_indices, mu0_indices])
 
     def test_differential_expression(
         self,
@@ -482,17 +314,6 @@ class InterceptRegression(PPIAbstractClass):
         feature_names: Optional[List[str]] = None,
         cond_thresh: float = np.inf,
     ) -> pd.DataFrame:
-        """
-        Perform differential expression testing.
-
-        Args:
-            idx_a: The index of the target class (1 or 2). Note: 0 is the reference class.
-            feature_names: List of feature names.
-            cond_thresh: Condition number threshold for Hessian.
-
-        Returns:
-            DataFrame containing the results (p-values, log-fold changes, etc.).
-        """
         idx_a_ = idx_a - 1
         results = []
         for feature_id in range(self.n_features):
@@ -522,7 +343,7 @@ class InterceptRegression(PPIAbstractClass):
                 }
             )
         res = pd.DataFrame(results)
-        res["pval"].iloc[np.isnan(res["pval"])] = 1.0
+        res.loc[np.isnan(res["pval"]), "pval"] = 1.0
         res["padj"] = multipletests(res["pval"], method="fdr_bh")[1]
         res["is_significant_005"] = res["padj"] < 0.05
         if feature_names is not None:
@@ -541,7 +362,10 @@ class InterceptRegression(PPIAbstractClass):
         self.model_params = params
 
     def hessian_fn(
-        self, inputs: Tuple[np.ndarray, np.ndarray], device=None
+        self,
+        inputs: Tuple[np.ndarray, np.ndarray],
+        importance_weights: Optional[np.ndarray] = None,
+        device=None,
     ) -> np.ndarray:
         x, y = inputs
 
@@ -552,13 +376,13 @@ class InterceptRegression(PPIAbstractClass):
         obs_ids = np.arange(n_obs)
         model_ = self.model
 
-        def likelihood(model_params, x, y):
-            return model_.apply(model_params, x, y)["loss"]
+        def likelihood(model_params, x, y, w=None):
+            return model_.apply(model_params, x, y, w=w)["loss"]
 
         hess_fn = jax.hessian(likelihood)
 
-        def process_hess(x, y):
-            hess_ = hess_fn(model_params_, x, y)
+        def process_hess(x, y, w=None):
+            hess_ = hess_fn(model_params_, x, y, w=w)
             mu_mu = (
                 hess_["params"]["mu"]["params"]["mu"]
                 .mean(0)
@@ -577,13 +401,12 @@ class InterceptRegression(PPIAbstractClass):
                 .mean(0)
                 .reshape(self.n_features, self.n_features)
             )
-            blk = jnp.block(
+            return jnp.block(
                 [
                     [mu_mu, mu_mu0],
                     [mu_mu0.T, mu0_mu0],
                 ]
             )
-            return blk
 
         hessian = np.zeros((self.n_params, self.n_params), dtype=np.float64)
         for obs_id in tqdm(obs_ids, desc="Hessian computation"):
@@ -591,6 +414,10 @@ class InterceptRegression(PPIAbstractClass):
             y_ = jnp.array(y[[obs_id]], dtype=jnp.int32)
             x_obs = jax.device_put(x_, device)
             y_obs = jax.device_put(y_, device)
-            hess_ = process_hess(x_obs, y_obs)
-            hessian += hess_ / float(n_obs)
+            if importance_weights is not None:
+                w_ = jnp.array(importance_weights[[obs_id]], dtype=jnp.float64)
+                w_obs = jax.device_put(w_, device)
+            else:
+                w_obs = None
+            hessian += process_hess(x_obs, y_obs, w_obs) / float(n_obs)
         return hessian

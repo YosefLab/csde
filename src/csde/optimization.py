@@ -102,6 +102,7 @@ def optimize_ppi_gd(
     y_hat: jnp.ndarray,
     x_unl: jnp.ndarray,
     y_unl: jnp.ndarray,
+    w: Optional[jnp.ndarray] = None,
     model_params0: Optional[Any] = None,
     lambd_: float = 1.0,
     tol: float = 1e-3,
@@ -123,6 +124,8 @@ def optimize_ppi_gd(
     y_hat = jax.device_put(jnp.array(y_hat, dtype=jnp.int32))
     x_unl = jax.device_put(jnp.array(x_unl, dtype=jnp.float64))
     y_unl = jax.device_put(jnp.array(y_unl, dtype=jnp.int32))
+    if w is not None:
+        w = jax.device_put(jnp.array(w, dtype=jnp.float64))
 
     x0 = jnp.ones((32, x_gt.shape[1]), dtype=jnp.float64)
     y0 = jnp.ones(32, dtype=jnp.int32)
@@ -142,23 +145,35 @@ def optimize_ppi_gd(
 
     lambd_ = jax.device_put(lambd_)
 
-    def loss_fn(zetas):
-        loss_gt = model.apply(zetas, x_gt, y_gt)["loss_unsummed"].mean(0)
-        loss_hat = model.apply(zetas, x_hat, y_hat)["loss_unsummed"].mean(0)
-        loss_unl = model.apply(zetas, x_unl, y_unl)["loss_unsummed"].mean(0)
-        loss = (lambd_ * loss_unl) - (lambd_ * loss_hat) + loss_gt
-        loss = loss.sum(-1)
-        return loss
+    def step_fn(theta_, opt_state_, x_gt_, y_gt_, x_hat_, y_hat_, x_unl_, y_unl_):
+        def loss_fn(zetas):
+            loss_gt = model.apply(zetas, x_gt_, y_gt_, w=w)["loss_unsummed"].mean(0)
+            loss_hat = model.apply(zetas, x_hat_, y_hat_, w=w)["loss_unsummed"].mean(0)
+            loss_unl = model.apply(zetas, x_unl_, y_unl_)["loss_unsummed"].mean(0)
+            loss = (lambd_ * loss_unl) - (lambd_ * loss_hat) + loss_gt
+            loss = loss.sum(-1)
 
-    value_and_grad_fn = jitter(jax.value_and_grad(loss_fn))
+            # loss_gt = model.apply(zetas, x_gt_, y_gt_, w=w)["loss"].mean()
+            # loss_hat = model.apply(zetas, x_hat_, y_hat_, w=w)["loss"].mean()
+            # loss_unl = model.apply(zetas, x_unl_, y_unl_)["loss"].mean()
+            # loss = (lambd_ * loss_unl) - (lambd_ * loss_hat) + loss_gt
+            return loss
+
+        loss, grad = jax.value_and_grad(loss_fn)(theta_)
+        updates, opt_state_ = opt.update(grad, opt_state_, theta_)
+        theta_ = optax.apply_updates(theta_, updates)
+        return theta_, opt_state_, loss
+
+    compiled_step = jitter(step_fn)
+
     previous_loss = 1e6
     print("lambda:", lambd_)
     print("tol:", tol_)
     pbar = trange(n_iter)
     for _ in pbar:
-        loss, grad = value_and_grad_fn(theta)
-        updates, opt_state = opt.update(grad, opt_state, theta)
-        theta = optax.apply_updates(theta, updates)
+        theta, opt_state, loss = compiled_step(
+            theta, opt_state, x_gt, y_gt, x_hat, y_hat, x_unl, y_unl
+        )
         stopping_criterion = np.abs(loss - previous_loss)
 
         if np.allclose(loss, previous_loss, atol=tol_, rtol=0):
