@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from csde.model_poisson import PoissonIntercept
+from csde.model_nb import NBIntercept
 
 
 def _map_cell_types(
@@ -46,6 +47,7 @@ def run_csde(
     gt_key: str,
     layer_name: Optional[str] = None,
     importance_weights: Optional[np.ndarray] = None,
+    noise_model: str = "poisson",
     **model_kwargs,
 ) -> pd.DataFrame:
     """
@@ -64,6 +66,7 @@ def run_csde(
         layer_name: Layer in adata.layers to use for expression counts. If None, uses .X.
         importance_weights: Optional 1-D array of importance weights for the ground-truth
             observations. Will be normalized to sum to n_obs internally.
+        noise_model: Noise model to use. Either "poisson" or "nb".
         **model_kwargs: Additional arguments passed to PoissonIntercept (e.g., optimizer).
 
     Returns:
@@ -109,13 +112,24 @@ def run_csde(
     inputs_unl = (X_unl, y_pred_unl)
 
     # inference
-    model = PoissonIntercept(
+    if noise_model == "poisson":
+        model = PoissonIntercept(
         inputs_gt=inputs_gt,
         inputs_hat=inputs_hat,
         inputs_unl=inputs_unl,
         importance_weights=importance_weights,
         **model_kwargs,
     )
+    elif noise_model == "nb":
+        model = NBIntercept(
+            inputs_gt=inputs_gt,
+            inputs_hat=inputs_hat,
+            inputs_unl=inputs_unl,
+            importance_weights=importance_weights,
+            **model_kwargs,
+        )
+    else:
+        raise ValueError(f"Unknown noise model: {noise_model}")
     model.fit(lambd_=None)
     model.get_asymptotic_distribution()
 

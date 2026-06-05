@@ -196,6 +196,7 @@ class PoissonIntercept(PPIAbstractClass):
                 y_hat=y_hat,
                 x_unl=x_unl,
                 y_unl=y_unl,
+                w=self.importance_weights,
                 model_params0=model_params0,
                 **self.optimizer_kwargs,
             )

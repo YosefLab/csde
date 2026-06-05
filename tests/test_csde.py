@@ -70,6 +70,27 @@ class TestCSDE(unittest.TestCase):
             optimizer="gd",
             optimizer_kwargs={"n_iter": 10},
             importance_weights=importance_weights,
+            noise_model="poisson",
+        )
+
+        self.assertIsInstance(res, pd.DataFrame)
+        self.assertEqual(len(res), 10)
+        self.assertListEqual(
+            list(res.columns), ["log_fold_change", "p_value", "p_value_adj"]
+        )
+        self.assertTrue(not res.isnull().values.any())
+
+        res = run_csde(
+            adata_pred=self.adata_pred,
+            adata_gt=self.adata_gt,
+            pred_cell_pop_key="cell_type",
+            cell_pop_a="TypeA",
+            cell_pop_b="TypeB",
+            gt_key="is_correct",
+            optimizer="gd",
+            optimizer_kwargs={"n_iter": 10},
+            importance_weights=importance_weights,
+            noise_model="nb",
         )
 
         self.assertIsInstance(res, pd.DataFrame)
