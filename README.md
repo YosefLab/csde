@@ -13,7 +13,7 @@ It allows users to
 2. manually validate the segmentation and type assignment for these cells
 3. run the CSDE model to get corrected DE estimates for all genes
 
-Refer to the [preprint](https://www.biorxiv.org/content/10.64898/2026.01.15.699786v1) for details on the method.
+Refer to the [preprint](https://www.biorxiv.org/content/10.64898/2026.01.15.699786v1) for details on the method. Reproducibility code is available [here](https://github.com/PierreBoyeau/csde_experiments).
 
 ### Input requirements
 
