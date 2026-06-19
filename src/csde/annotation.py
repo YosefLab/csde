@@ -88,7 +88,19 @@ def prepare_csde_inputs(
 
     if sdata is None:
         import spatialdata as sd
-        sdata = sd.read_zarr(config["sdata"])
+        sdata_path = config.get("sdata")
+        if not sdata_path:
+            raise ValueError(
+                "No sdata path found in config.json. "
+                "Pass sdata directly: prepare_csde_inputs(..., sdata=your_sdata_object)."
+            )
+        if not Path(sdata_path).exists():
+            raise FileNotFoundError(
+                f"SpatialData zarr not found at '{sdata_path}' (path stored in config.json). "
+                "Either restore the zarr to that path, or pass sdata directly: "
+                "prepare_csde_inputs(..., sdata=your_sdata_object)."
+            )
+        sdata = sd.read_zarr(sdata_path)
     adata = sdata["table"].copy()
     adata.obs_names = adata.obs_names.astype(str)
     adata = adata[adata.obs[cell_type_key].notna()].copy()

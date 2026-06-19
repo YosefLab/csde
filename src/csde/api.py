@@ -71,10 +71,10 @@ def run_csde(
 
     Returns:
         DataFrame indexed by gene names with columns:
-        - log_fold_change: Log-fold change of expression (cell_pop_b vs cell_pop_a).
-        - p_value: P-value for the differential expression hypothesis.
-        - p_value_adj: Multiplicity-adjusted p-value.
-        - beta: The estimated coefficient.
+        - log_fold_change: Estimated log-fold change of expression
+          (positive = upregulated in cell_pop_b relative to cell_pop_a).
+        - p_value: Raw two-sided p-value for the differential expression hypothesis.
+        - p_value_adj: Benjamini-Hochberg multiplicity-adjusted p-value.
     """
 
     # create simplified 3-class representation for predictions  (pop_a, pop_b, other)

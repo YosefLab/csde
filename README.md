@@ -17,7 +17,9 @@ Refer to the [preprint](https://www.biorxiv.org/content/10.64898/2026.01.15.6997
 
 ### Input requirements
 
-The workflow takes a [SpatialData](https://spatialdata.scverse.org/) zarr as input. Its `"table"` AnnData must contain:
+The workflow takes a [SpatialData](https://spatialdata.scverse.org/) zarr as input.
+
+Its `"table"` AnnData must contain:
 
 - **raw expression counts** in `.X` or a named layer
 - **the following `obs` columns:**
@@ -28,7 +30,15 @@ The workflow takes a [SpatialData](https://spatialdata.scverse.org/) zarr as inp
 | `spatial_group` (configurable) | binary spatial region label (e.g. `0` = outside tumour, `1` = inside tumour) |
 | `center_x`, `center_y` | cell centroid in microns |
 
-The zarr must also expose at least one **fluorescence image channel** (e.g. `"DAPI"`, `"Cellbound2"`) used to render the per-cell annotation panels.
+The zarr must also expose the following SpatialData elements, used to render the per-cell annotation panels (Step 1):
+
+| element | requirement |
+| --- | --- |
+| `images` | at least one image with a named **fluorescence channel** (e.g. `"DAPI"`, `"Cellbound2"`) |
+| `shapes` | at least one element holding the **cell-boundary polygons** |
+| `points` | at least one element holding **transcript locations**, with a `gene` column |
+
+The cell-boundary `shapes` must carry a transformation to the `global` coordinate system: it converts the micron `center_x`/`center_y` centroids into the image's pixel space. This conversion assumes a pure scale-and-translation transform (as produced for MERSCOPE); transforms with rotation or shear are not handled.
 
 ## Installation
 
@@ -40,6 +50,8 @@ pip install "csde[cuda12,annotate]" # both
 ```
 
 ## Workflow overview
+
+CSDE runs as three scripts executed in sequence, each consuming the previous one's output: `export.py` samples a small set of cells and renders an annotation panel for each, `annotate.py` lets you manually mark those cells as correct or incorrect, and `differential_expression.py` feeds those validated labels into the CSDE model to produce corrected DE estimates. All three share a single annotation directory.
 
 ```
 SpatialData zarr
@@ -74,10 +86,13 @@ python scripts/export.py \
 --target-proportion 0.4 \
 --gene-colors scripts/gene_colors_file.json \
 --image-channel Cellbound2 \
---n-cells 600
+--n-cells 600 \
+--layer counts
 ```
 
 `--target-proportion` controls the fraction of cells of interest in the subsample. Cells of interest are upweighted accordingly (importance sampling); the unnormalized weight for each sampled cell is stored in `metadata.csv` for downstream use.
+
+`--layer` selects which expression matrix to read: the named `.layers` entry holding the raw counts (e.g. `counts`), or `.X` when omitted. The value is saved to `config.json` and reused throughout the workflow — the same layer feeds the top-gene panels here in Step 1 and the CSDE model in Step 3, so set it once at export time. **It must point at raw counts**, since the noise model (Poisson / negative binomial) assumes integer counts; pointing it at normalised or log-transformed values will produce invalid results.
 
 The script writes:
 
@@ -108,39 +123,22 @@ A simple JSON mapping gene names to colours:
 }
 ```
 
-<details>
-<summary>Python API</summary>
-
-```python
-import json
-import spatialdata as sd
-from csde import export_cell_panels, subsample_cells, plot_top_genes
-
-sdata = sd.read_zarr("/path/to/region.zarr")
-gene_colors = json.load(open("gene_colors.json"))
-
-metadata = export_cell_panels(
-    sdata=sdata,
-    annotation_dir="/path/to/annotation_dir",
-    cell_type_key="cell_type",
-    cell_type_of_interest="macrophages",
-    target_proportion=0.4,
-    gene_colors=gene_colors,
-    image_channel="Cellbound2",
-    n_cells=600,
-)
-```
-</details>
-
 ---
 
 ## Step 2 — Manual validation (`scripts/annotate.py`)
 
-For each exported image, an annotator decides whether the automated cell-type label is correct. The result is a boolean column `is_correct` added to `metadata.csv`, which becomes `adata_gt` in Step 3.
+For each exported image, an annotator decides whether the cell is **correct** — meaning it is both properly **segmented** and properly **labelled**. A cell should be rejected (marked incorrect) when either check fails:
+
+- **Segmentation** — the cell boundary (left panel) is not consistent with the nuclei / membrane staining, e.g. it merges two cells or clips part of one.
+- **Cell-type label** — the top expressed genes (right panel) include genes unlikely to be expressed by the cell type of interest, suggesting the automated label is wrong.
+
+The result is a boolean column `is_correct` added to `metadata.csv`, which becomes `adata_gt` in Step 3.
 
 ```bash
 streamlit run scripts/annotate.py -- --dir /path/to/annotation_dir
 ```
+
+The `--` is required: it tells Streamlit to pass everything after it to the script rather than interpreting it as Streamlit's own options.
 
 VS Code Remote forwards the Streamlit port automatically. Open the URL printed in the terminal, then use:
 
@@ -174,40 +172,3 @@ Reads all export settings from `config.json` and writes gene-level results to `<
 | `log_fold_change` | estimated LFC (positive = upregulated in target population) |
 | `p_value` | raw two-sided p-value |
 | `p_value_adj` | Benjamini-Hochberg adjusted p-value |
-
-<details>
-<summary>Python API</summary>
-
-The full CSDE statistical model is callable directly from Python, without going through the CLI scripts.
-
-`prepare_csde_inputs` reads `config.json`, `metadata.csv`, and `annotations.json` from the annotation directory produced by Steps 1 & 2. It returns two AnnData objects restricted to the same gene set:
-
-- `adata_gt` — the manually validated cells, with an `is_correct` boolean column in `.obs` and a `sampling_weight` column reflecting the importance-sampling weight assigned during export
-- `adata_other` — all remaining cells (not manually validated); their `obs` must contain a `prediction` column (integer) encoding the spatial population each cell was assigned to by the automated pipeline: `0` = reference region, `1` = target region, `2` = neither
-
-```python
-from csde import prepare_csde_inputs, run_csde
-
-inputs = prepare_csde_inputs(
-    annotation_dir="/path/to/annotation_dir",  # same dir as Steps 1 & 2
-    spatial_group_key="spatial_group",
-    n_cells_expressed_threshold=10,
-)
-adata_gt    = inputs["adata_gt"]    # manually validated cells
-adata_other = inputs["adata_other"] # all other cells
-
-results = run_csde(
-    adata_pred=adata_other,
-    adata_gt=adata_gt,
-    pred_cell_pop_key="prediction",  # obs column: 0=reference, 1=target, 2=other
-    cell_pop_a=0,                    # reference population
-    cell_pop_b=1,                    # target population (LFC = log(target/reference))
-    gt_key="is_correct",             # boolean correctness label from Step 2
-    layer_name="counts",
-    importance_weights=adata_gt.obs["sampling_weight"].values,  # from metadata.csv
-)
-# DataFrame indexed by gene: log_fold_change, p_value, p_value_adj
-print(results.head())
-```
-
-</details>
