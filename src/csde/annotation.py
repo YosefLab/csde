@@ -5,9 +5,79 @@ import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 from .spatial_utils import plot_region, plot_top_genes, subsample_cells
+
+# --- annotations.json schema -------------------------------------------------
+# {cell_id: {"action": "accept" | "correct" | "reject", "label": str | None}}
+#
+# ``label`` is set only for "correct"; the manual cell type of an accepted cell
+# is resolved from the automated label at read time, so a cell type is never
+# recorded in two places. scripts/annotate.py writes this file and mirrors these
+# constants; the validation below is what keeps the two in step.
+ACCEPT = "accept"
+CORRECT = "correct"
+REJECT = "reject"
+ANNOTATION_ACTIONS = (ACCEPT, CORRECT, REJECT)
+
+
+def _resolve_group_value(value, observed: set):
+    """
+    Match a requested spatial-group value against the values in the obs column.
+
+    Exact equality first, then string equality, so that a value coming from the
+    command line (always a string) matches an integer-encoded column. Returns the
+    value as it appears in the column, or the input unchanged when there is no
+    match — the caller reports that.
+    """
+    if value in observed:
+        return value
+    by_str = {str(seen): seen for seen in observed}
+    return by_str.get(str(value), value)
+
+
+def read_annotations(annotation_dir: str | Path) -> dict:
+    """
+    Load ``annotations.json`` and validate it against the schema above.
+
+    Returns
+    -------
+    dict
+        ``{cell_id: {"action": ..., "label": ...}}``, with ``cell_id`` as ``str``.
+    """
+    annotation_dir = Path(annotation_dir)
+    ann_path = annotation_dir / "annotations.json"
+    if not ann_path.exists():
+        raise FileNotFoundError(
+            f"No annotations found at {ann_path}. Run scripts/annotate.py first."
+        )
+    with open(ann_path) as f:
+        records = json.load(f)
+
+    for cell_id, record in records.items():
+        if not isinstance(record, dict) or "action" not in record:
+            raise ValueError(
+                f"Malformed annotation for cell '{cell_id}': {record!r}. Expected "
+                '{"action": "accept" | "correct" | "reject", "label": str | None}.'
+            )
+        action, label = record["action"], record.get("label")
+        if action not in ANNOTATION_ACTIONS:
+            raise ValueError(
+                f"Unknown action '{action}' for cell '{cell_id}'. "
+                f"Expected one of {ANNOTATION_ACTIONS}."
+            )
+        if action == CORRECT and label is None:
+            raise ValueError(
+                f"Cell '{cell_id}' is annotated as '{CORRECT}' but carries no label."
+            )
+        if action != CORRECT and label is not None:
+            raise ValueError(
+                f"Cell '{cell_id}' is annotated as '{action}' but carries label "
+                f"'{label}'. Only '{CORRECT}' annotations may set a label."
+            )
+    return {str(cell_id): record for cell_id, record in records.items()}
 
 
 def prepare_csde_inputs(
@@ -24,15 +94,23 @@ def prepare_csde_inputs(
 
     Reads config.json (cell_type_key, cell_type_of_interest, sdata path),
     metadata.csv (sampling_weight per annotated cell), and annotations.json
-    (is_correct per cell) from annotation_dir.
+    (accept / correct / reject per cell) from annotation_dir.
+
+    This function owns the translation from annotation scheme to model labels:
+    :func:`~csde.run_csde` consumes ``.obs["annotation"]`` as-is.
 
     Label encoding in .obs["prediction"] / .obs["annotation"]:
         1 — cell_type_of_interest with spatial_group == 1  (target)
         0 — cell_type_of_interest with spatial_group == 0  (reference)
         2 — all other cells
 
-    For GT annotation labels, cells predicted as cell_type_of_interest but
-    marked incorrect (is_correct=False) are reassigned to class 2.
+    ``prediction`` uses the automated cell type; ``annotation`` uses the manual
+    cell type, which is the automated one for an *accepted* cell, the annotator's
+    choice for a *corrected* one, and undefined (hence class 2) for a *rejected*
+    one. A corrected cell keeps its automated spatial group: only the cell-type
+    component of the label is curated. Correcting a cell *into*
+    cell_type_of_interest therefore moves it from class 2 into class 0 or 1,
+    which is the case an accept/reject scheme cannot express.
 
     Parameters
     ----------
@@ -59,14 +137,16 @@ def prepare_csde_inputs(
 
     adata_gt : AnnData
         Annotated cells. obs columns added: ``prediction`` (int 0/1/2),
-        ``annotation`` (int 0/1/2), ``is_correct`` (bool),
-        ``sampling_weight`` (float). Genes are filtered.
+        ``annotation`` (int 0/1/2), ``manual_action`` (str),
+        ``manual_cell_type`` (str or None), ``sampling_weight`` (float).
+        Genes are filtered.
     adata_other : AnnData
         All unannotated cells. obs column added: ``prediction`` (int 0/1/2).
         Same gene set as adata_gt.
+    summary : dict
+        Per-action counts plus ``n_promoted`` / ``n_demoted``, the number of
+        cells the manual curation moved into / out of the compared groups.
     """
-    import numpy as np
-
     annotation_dir = Path(annotation_dir)
 
     with open(annotation_dir / "config.json") as f:
@@ -74,13 +154,7 @@ def prepare_csde_inputs(
     cell_type_key = config["cell_type_key"]
     cell_type_of_interest = config["cell_type_of_interest"]
 
-    ann_path = annotation_dir / "annotations.json"
-    if not ann_path.exists():
-        raise FileNotFoundError(
-            f"No annotations found at {ann_path}. Run scripts/annotate.py first."
-        )
-    with open(ann_path) as f:
-        annotations = json.load(f)  # {cell_id: True/False}
+    annotations = read_annotations(annotation_dir)
 
     metadata = pd.read_csv(annotation_dir / "metadata.csv")
     metadata["cell_id"] = metadata["cell_id"].astype(str)
@@ -105,6 +179,38 @@ def prepare_csde_inputs(
     adata.obs_names = adata.obs_names.astype(str)
     adata = adata[adata.obs[cell_type_key].notna()].copy()
 
+    if cell_type_of_interest not in set(adata.obs[cell_type_key].unique()):
+        raise ValueError(
+            f"cell_type_of_interest={cell_type_of_interest!r} was not found in obs "
+            f"column '{cell_type_key}', which contains "
+            f"{sorted(map(str, adata.obs[cell_type_key].unique()))}."
+        )
+
+    # Fail before any label math: a region value that does not occur would send
+    # every cell to class 2, and the resulting emptiness would only surface much
+    # later as a confusing "population not found" error. Not auto-detected from a
+    # two-level column on purpose — which value becomes the target sets the sign
+    # of every log-fold change, so it has to be chosen explicitly.
+    observed_groups = set(adata.obs[spatial_group_key].unique())
+    spatial_group_target = _resolve_group_value(spatial_group_target, observed_groups)
+    spatial_group_reference = _resolve_group_value(
+        spatial_group_reference, observed_groups
+    )
+    missing = [
+        value
+        for value in (spatial_group_target, spatial_group_reference)
+        if value not in observed_groups
+    ]
+    if missing:
+        raise ValueError(
+            f"spatial_group_target={spatial_group_target!r} and "
+            f"spatial_group_reference={spatial_group_reference!r}: "
+            f"{missing!r} not found in obs column '{spatial_group_key}', which "
+            f"contains {sorted(map(str, observed_groups))}. Pass "
+            "--spatial-group-target / --spatial-group-reference to choose the two "
+            "regions to compare."
+        )
+
     # --- Prediction labels (automated, all cells) ---
     is_coi = (adata.obs[cell_type_key] == cell_type_of_interest).values
     spatial_group = adata.obs[spatial_group_key].values
@@ -120,21 +226,93 @@ def prepare_csde_inputs(
 
     adata_gt = adata[annotated_mask].copy()
 
-    is_correct_arr = np.array(
-        [annotations[cid] for cid in adata_gt.obs_names], dtype=bool
+    # --- Manual cell type: accepted keeps the automated label, corrected takes
+    #     the annotator's, rejected has none ---
+    actions = np.array(
+        [annotations[cid]["action"] for cid in adata_gt.obs_names], dtype=object
     )
-    adata_gt.obs["is_correct"] = is_correct_arr
+    manual_cell_type = []
+    for cell_id, predicted_type in zip(
+        adata_gt.obs_names, adata_gt.obs[cell_type_key]
+    ):
+        record = annotations[cell_id]
+        if record["action"] == REJECT:
+            manual_cell_type.append(None)
+        elif record["action"] == CORRECT:
+            manual_cell_type.append(record["label"])
+        else:
+            manual_cell_type.append(predicted_type)
+
+    # The vocabulary is closed: a corrected label absent from the data would
+    # otherwise fall through to class 2 and be indistinguishable from a rejection.
+    vocabulary = set(adata.obs[cell_type_key].unique())
+    unknown = sorted(
+        {
+            label
+            for label, action in zip(manual_cell_type, actions)
+            if action == CORRECT and label not in vocabulary
+        }
+    )
+    if unknown:
+        raise ValueError(
+            f"Corrected labels {unknown} are not present in "
+            f"'{cell_type_key}' of the SpatialData table. Known cell types: "
+            f"{sorted(vocabulary)}."
+        )
+
+    adata_gt.obs["manual_action"] = actions
+    adata_gt.obs["manual_cell_type"] = manual_cell_type
 
     # --- Annotation (GT) labels ---
-    is_coi_gt = (adata_gt.obs[cell_type_key] == cell_type_of_interest).values
+    # The spatial group is always the automated one: manual curation revises the
+    # cell type, never the region.
+    is_coi_gt = np.array(
+        [label == cell_type_of_interest for label in manual_cell_type]
+    )
     spatial_group_gt = adata_gt.obs[spatial_group_key].values
 
     annotation = np.full(len(adata_gt), 2, dtype=int)
-    annotation[is_coi_gt & is_correct_arr & (spatial_group_gt == spatial_group_target)] = 1
-    annotation[is_coi_gt & is_correct_arr & (spatial_group_gt == spatial_group_reference)] = 0
+    annotation[is_coi_gt & (spatial_group_gt == spatial_group_target)] = 1
+    annotation[is_coi_gt & (spatial_group_gt == spatial_group_reference)] = 0
     adata_gt.obs["annotation"] = annotation
 
     adata_gt.obs["sampling_weight"] = adata_gt.obs_names.map(sampling_weights).values
+
+    prediction_gt = adata_gt.obs["prediction"].values
+    summary = {
+        "n_annotated": int(len(adata_gt)),
+        **{
+            f"n_{action}": int((actions == action).sum())
+            for action in ANNOTATION_ACTIONS
+        },
+        # Cells the curation moved into / out of the two compared groups.
+        "n_promoted": int(((prediction_gt == 2) & (annotation != 2)).sum()),
+        "n_demoted": int(((prediction_gt != 2) & (annotation == 2)).sum()),
+    }
+
+    # Both label sets must populate both compared groups. Checked here, rather
+    # than left to fail at fit time, so the message can name the region and the
+    # counts: this is usually an annotation-budget problem, not a wiring one.
+    for labels, source in (
+        (prediction_gt, "the automated pipeline"),
+        (annotation, "manual annotation"),
+    ):
+        for group, region in (
+            (0, spatial_group_reference),
+            (1, spatial_group_target),
+        ):
+            if (labels == group).sum() > 0:
+                continue
+            n_in_groups = int((labels != 2).sum())
+            raise ValueError(
+                f"No annotated cell falls in group {group} "
+                f"({cell_type_of_interest!r} in region {region!r}) according to "
+                f"{source}, so its expression cannot be estimated. Of "
+                f"{len(adata_gt)} annotated cells, {n_in_groups} are "
+                f"{cell_type_of_interest!r} across both regions. Annotate more "
+                "cells, or raise --target-proportion at export time to sample "
+                f"more {cell_type_of_interest!r}."
+            )
 
     # --- Gene filter: expressed in >= threshold pred-target/ref cells in adata_gt ---
     # pred_mask = adata_gt.obs["prediction"].isin([0, 1])
@@ -150,30 +328,40 @@ def prepare_csde_inputs(
     adata_gt = adata_gt[:, gene_mask].copy()
     adata_other = adata[~annotated_mask][:, gene_mask].copy()
 
-    return {"adata_gt": adata_gt, "adata_other": adata_other}
+    return {"adata_gt": adata_gt, "adata_other": adata_other, "summary": summary}
 
 
 def load_annotations(annotation_dir: str | Path) -> pd.DataFrame:
     """
     Merge ``metadata.csv`` and ``annotations.json`` into a single DataFrame.
 
-    Returns only annotated cells, with an added boolean ``is_correct`` column.
-    Pass the result as ``adata_gt`` to :func:`~csde.run_csde`.
+    Returns only annotated cells, with added ``action`` (accept / correct /
+    reject) and ``manual_cell_type`` columns. The latter is the automated
+    ``cell_type`` for accepted cells, the annotator's choice for corrected ones,
+    and None for rejected ones.
+
+    This is a convenience view for inspecting annotations; the model labels are
+    built by :func:`prepare_csde_inputs`.
     """
     annotation_dir = Path(annotation_dir)
     metadata = pd.read_csv(annotation_dir / "metadata.csv")
     metadata["cell_id"] = metadata["cell_id"].astype(str)
 
-    ann_path = annotation_dir / "annotations.json"
-    if not ann_path.exists():
-        raise FileNotFoundError(
-            f"No annotations found at {ann_path}. Run scripts/annotate.py first."
-        )
-    with open(ann_path) as f:
-        annotations = json.load(f)
+    annotations = read_annotations(annotation_dir)
 
-    metadata["is_correct"] = metadata["cell_id"].map(annotations)
-    return metadata[metadata["is_correct"].notna()].copy()
+    metadata["action"] = metadata["cell_id"].map(
+        {cell_id: record["action"] for cell_id, record in annotations.items()}
+    )
+    metadata = metadata[metadata["action"].notna()].copy()
+    metadata["manual_cell_type"] = [
+        None
+        if action == REJECT
+        else (annotations[cell_id]["label"] if action == CORRECT else predicted)
+        for cell_id, action, predicted in zip(
+            metadata["cell_id"], metadata["action"], metadata["cell_type"]
+        )
+    ]
+    return metadata
 
 
 def export_cell_panels(

@@ -33,7 +33,7 @@ dev = [
     "isort",
     "flake8",
 ]
-annotate = ["streamlit"]
+annotate = ["streamlit>=1.30"]
 cuda12 = ["jax[cuda12]"]
 cuda13 = ["jax[cuda13]"]
 
