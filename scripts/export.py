@@ -35,6 +35,11 @@ def parse_args():
                    help="JSON file mapping gene name → colour.")
     p.add_argument("--image-channel", default="DAPI")
     p.add_argument("--n-cells", type=int, default=600)
+    p.add_argument("--annotation-mode",
+                   choices=["accept_correct_reject", "accept_reject"],
+                   default="accept_correct_reject",
+                   help="Actions offered by annotate.py. accept_correct_reject "
+                        "additionally lets the annotator relabel a cell.")
     p.add_argument("--delta", type=float, default=50.0,
                    help="Half-width of the spatial crop around each cell (microns).")
     p.add_argument("--n-top-genes", type=int, default=15)
@@ -58,8 +63,10 @@ def main():
     annotation_dir = Path(args.out)
     annotation_dir.mkdir(parents=True, exist_ok=True)
 
+    cell_types = sdata["table"].obs[args.cell_type_key].dropna().unique()
+    config = vars(args) | {"cell_type_vocabulary": sorted(map(str, cell_types))}
     with open(annotation_dir / "config.json", "w") as f:
-        json.dump(vars(args), f, indent=2)
+        json.dump(config, f, indent=2)
 
     metadata = export_cell_panels(
         sdata=sdata,

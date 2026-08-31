@@ -27,7 +27,7 @@ Its `"table"` AnnData must contain:
 | obs column | content |
 | --- | --- |
 | `cell_type` (configurable) | cell-type label for each cell |
-| `spatial_group` (configurable) | binary spatial region label (e.g. `0` = outside tumour, `1` = inside tumour) |
+| `spatial_group` (configurable) | spatial region label with two values to compare (e.g. `0`/`1`, or `"out_of_tumor"`/`"in_tumor"`). Which value is the target is chosen in Step 3 with `--spatial-group-target` / `--spatial-group-reference`, defaulting to `1` / `0` |
 | `center_x`, `center_y` | cell centroid in microns |
 
 The zarr must also expose the following SpatialData elements, used to render the per-cell annotation panels (Step 1):
@@ -90,6 +90,12 @@ python scripts/export.py \
 --layer counts
 ```
 
+`--annotation-mode` selects the actions offered in Step 2, and defaults to
+`accept_correct_reject`. Use `--annotation-mode accept_reject` to drop the relabelling
+option. The value is saved to `config.json`; because the cell-type vocabulary is written
+there too (always, whatever the mode), you can switch modes afterwards by editing
+`config.json`, without re-exporting the panels.
+
 `--target-proportion` controls the fraction of cells of interest in the subsample. Cells of interest are upweighted accordingly (importance sampling); the unnormalized weight for each sampled cell is stored in `metadata.csv` for downstream use.
 
 `--layer` selects which expression matrix to read: the named `.layers` entry holding the raw counts (e.g. `counts`), or `.X` when omitted. The value is saved to `config.json` and reused throughout the workflow — the same layer feeds the top-gene panels here in Step 1 and the CSDE model in Step 3, so set it once at export time. **It must point at raw counts**, since the noise model (Poisson / negative binomial) assumes integer counts; pointing it at normalised or log-transformed values will produce invalid results.
@@ -101,9 +107,9 @@ The script writes:
 ├── images/
 │   ├── cell_<id>.png   # one panel per cell
 │   └── ...
-├── config.json         # all export arguments (read by annotate.py)
+├── config.json         # export arguments + cell_type_vocabulary (read by annotate.py)
 ├── metadata.csv        # cell_id, cell_type, image_path, sampling_weight, center_x, center_y
-└── annotations.json    # {cell_id: true/false} — written by annotate.py
+└── annotations.json    # {cell_id: {action, label}} — written by annotate.py
 ```
 
 Each panel contains:
@@ -127,12 +133,27 @@ A simple JSON mapping gene names to colours:
 
 ## Step 2 — Manual validation (`scripts/annotate.py`)
 
-For each exported image, an annotator decides whether the cell is **correct** — meaning it is both properly **segmented** and properly **labelled**. A cell should be rejected (marked incorrect) when either check fails:
+For each exported image, the annotator runs two checks in order:
 
-- **Segmentation** — the cell boundary (left panel) is not consistent with the nuclei / membrane staining, e.g. it merges two cells or clips part of one.
-- **Cell-type label** — the top expressed genes (right panel) include genes unlikely to be expressed by the cell type of interest, suggesting the automated label is wrong.
+1. **Segmentation** — is the cell boundary (left panel) consistent with the nuclei / membrane staining, or does it merge two cells or clip part of one?
+2. **Cell-type label** — are the top expressed genes (right panel) consistent with the assigned label?
 
-The result is a boolean column `is_correct` added to `metadata.csv`, which becomes `adata_gt` in Step 3.
+which lead to one of three actions:
+
+| action | when | effect |
+| --- | --- | --- |
+| **accept** | segmentation fine, label fine | the cell keeps its automated label |
+| **correct** | segmentation fine, label wrong | the annotator picks the right cell type |
+| **reject** | segmentation inadequate | the cell is excluded from both compared groups |
+
+Correcting a cell revises only its **cell type**; its spatial region is treated as reliable
+and is always taken from the automated pipeline. So correcting a cell *into* the cell type
+of interest is what places it in the target or reference group, according to the region it
+already sits in — this is the case an accept/reject workflow cannot express.
+
+Segmentation is never edited: an accepted or corrected cell keeps the automated expression
+counts. Rejection therefore doubles as a quality-control filter for cells whose
+quantification cannot be trusted at all.
 
 ```bash
 streamlit run scripts/annotate.py -- --dir /path/to/annotation_dir
@@ -142,10 +163,19 @@ The `--` is required: it tells Streamlit to pass everything after it to the scri
 
 VS Code Remote forwards the Streamlit port automatically. Open the URL printed in the terminal, then use:
 
-- **`1`** — label as correct
-- **`2`** — label as incorrect
+| key | `accept_correct_reject` (default) | `accept_reject` |
+| --- | --- | --- |
+| **`1`** | accept | accept |
+| **`2`** | correct | reject |
+| **`3`** | reject | — |
 
-Progress is saved after every keypress to `annotations.json`. Re-running the command resumes from where you left off. You can also start annotating while `export.py` is still running — the UI picks up newly exported cells automatically.
+Pressing **`2`** in `accept_correct_reject` mode opens a cell-type selector below the panel
+— type a few characters to filter, then pick the label. Nothing is written until you
+choose one, so pressing `2` by mistake is harmless: hit Cancel and the cell stays
+unannotated.
+
+Progress is saved after every keypress to `annotations.json`, as
+`{cell_id: {"action": ..., "label": ...}}` (`label` is set only for corrections). Re-running the command resumes from where you left off. You can also start annotating while `export.py` is still running — the UI picks up newly exported cells automatically.
 
 ---
 
@@ -157,11 +187,27 @@ python scripts/differential_expression.py --dir /path/to/annotation_dir
 
 Reads all export settings from `config.json` and writes gene-level results to `<dir>/results.csv`.
 
+The three-way comparison is built here: cells of interest in spatial group `0` (reference)
+and group `1` (target) form the two compared populations, and everything else — including
+rejected cells — is collapsed into a third group. Both the automated labels and the manual
+ones are built the same way; only the cell type differs between them. The script prints a
+summary of the annotations first (counts per action, plus how many cells the curation moved
+into and out of the compared groups), which is the quickest check that the annotations were
+read as intended.
+
+If your region column is not encoded as `1` / `0`, set `--spatial-group-target` and
+`--spatial-group-reference` to the two values you want to compare; the script reports the
+values it found if they don't match. The target region is the one positive log-fold changes
+refer to, so swapping the two flips the sign of every result — this is deliberately not
+inferred for you, even when the column has exactly two values.
+
 | option | default | description |
 |---|---|---|
 | `--dir` | *(required)* | annotation directory (output of steps 1 & 2) |
 | `--out` | `<dir>/results.csv` | output CSV path |
 | `--spatial-group-key` | `spatial_group` | obs column encoding the two spatial populations |
+| `--spatial-group-target` | `1` | value of that column identifying the target region (group 1) |
+| `--spatial-group-reference` | `0` | value of that column identifying the reference region (group 0) |
 | `--n-cells-expressed-threshold` | `10` | min annotated cells expressing a gene for it to be tested |
 | `--noise-model` | `poisson` | `poisson` or `nb` (negative binomial) |
 

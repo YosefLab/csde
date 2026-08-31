@@ -13,24 +13,26 @@ def _map_cell_types(
     cell_type_col: str,
     cell_pop_a: str,
     cell_pop_b: str,
+    context: str = "dataset",
+    hint: str = "",
 ) -> np.ndarray:
     """
     Map cell types to a simplified 3-class representation.
     0: cell_pop_a (Reference)
     1: cell_pop_b (Target)
     2: Other
+
+    ``context`` and ``hint`` only shape the error raised when a population is
+    empty; the mapping itself is identical for the automated and manual labels.
     """
     labels = np.full(len(obs), 2, dtype=int)
 
-    # Check if cell types exist
-    if cell_pop_a not in obs[cell_type_col].values:
-        raise ValueError(
-            f"Cell population '{cell_pop_a}' not found in column '{cell_type_col}'"
-        )
-    if cell_pop_b not in obs[cell_type_col].values:
-        raise ValueError(
-            f"Cell population '{cell_pop_b}' not found in column '{cell_type_col}'"
-        )
+    for cell_pop in (cell_pop_a, cell_pop_b):
+        if cell_pop not in obs[cell_type_col].values:
+            raise ValueError(
+                f"No cells assigned to population '{cell_pop}' in column "
+                f"'{cell_type_col}' of the {context}.{hint}"
+            )
 
     labels[obs[cell_type_col] == cell_pop_a] = 0
     labels[obs[cell_type_col] == cell_pop_b] = 1
@@ -42,9 +44,9 @@ def run_csde(
     adata_pred: anndata.AnnData,
     adata_gt: anndata.AnnData,
     pred_cell_pop_key: str,
+    gt_cell_pop_key: str,
     cell_pop_a: str,
     cell_pop_b: str,
-    gt_key: str,
     layer_name: Optional[str] = None,
     importance_weights: Optional[np.ndarray] = None,
     noise_model: str = "poisson",
@@ -60,9 +62,14 @@ def run_csde(
         adata_pred: AnnData object containing cells with prediction-based assignments only.
         adata_gt: AnnData object containing cells with ground-truth assignments.
         pred_cell_pop_key: Column in .obs containing the prediction-based cell population labels.
+            Read from both ``adata_pred`` and ``adata_gt``.
+        gt_cell_pop_key: Column in adata_gt.obs containing the manually curated cell
+            population labels. Built upstream by
+            :func:`~csde.prepare_csde_inputs`, which resolves the annotation scheme
+            (accept/reject or accept/correct/reject) into labels; this function only
+            consumes them.
         cell_pop_a: Name of the first cell population (reference group).
         cell_pop_b: Name of the second cell population (target group).
-        gt_key: Boolean column in adata_gt.obs indicating if the prediction is correct.
         layer_name: Layer in adata.layers to use for expression counts. If None, uses .X.
         importance_weights: Optional 1-D array of importance weights for the ground-truth
             observations. Will be normalized to sum to n_obs internally.
@@ -77,24 +84,35 @@ def run_csde(
         - p_value_adj: Benjamini-Hochberg multiplicity-adjusted p-value.
     """
 
-    # create simplified 3-class representation for predictions  (pop_a, pop_b, other)
+    # create simplified 3-class representation  (pop_a, pop_b, other).
+    # The automated and manual labels are mapped identically; the annotation
+    # scheme that produced the manual labels is resolved upstream.
     y_pred_unl = _map_cell_types(
-        adata_pred.obs, pred_cell_pop_key, cell_pop_a, cell_pop_b
+        adata_pred.obs,
+        pred_cell_pop_key,
+        cell_pop_a,
+        cell_pop_b,
+        context="unlabeled set",
     )
     y_pred_gt_set = _map_cell_types(
-        adata_gt.obs, pred_cell_pop_key, cell_pop_a, cell_pop_b
+        adata_gt.obs,
+        pred_cell_pop_key,
+        cell_pop_a,
+        cell_pop_b,
+        context="automated labels of the manually annotated set",
     )
-
-    # logic to construct gt labels based on boolean column gt_key
-    # - if predicted as a and correct (gt_key=true) -> gt is a (0)
-    # - if predicted as b and correct (gt_key=true) -> gt is b (1)
-    # - else -> gt is other (2)
-    y_gt = np.full(len(adata_gt), 2, dtype=int)
-    is_correct = adata_gt.obs[gt_key].values.astype(bool)
-    is_pred_a = (adata_gt.obs[pred_cell_pop_key] == cell_pop_a).values
-    is_pred_b = (adata_gt.obs[pred_cell_pop_key] == cell_pop_b).values
-    y_gt[is_pred_a & is_correct] = 0
-    y_gt[is_pred_b & is_correct] = 1
+    y_gt = _map_cell_types(
+        adata_gt.obs,
+        gt_cell_pop_key,
+        cell_pop_a,
+        cell_pop_b,
+        context="manually annotated set",
+        hint=(
+            " No annotated cell was curated into this group, so its expression "
+            "cannot be estimated. Annotate more cells, or increase the "
+            "importance-sampling weight of the cell type of interest."
+        ),
+    )
 
     def get_X(adata):
         if layer_name:

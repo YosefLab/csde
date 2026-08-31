@@ -1,4 +1,10 @@
-from .annotation import export_cell_panels, load_annotations, prepare_csde_inputs
+from .annotation import (
+    ANNOTATION_ACTIONS,
+    export_cell_panels,
+    load_annotations,
+    prepare_csde_inputs,
+    read_annotations,
+)
 from .api import run_csde
 from .model_nb import NBIntercept, NBInterceptModule
 from .model_poisson import PoissonIntercept, PoissonInterceptModule
@@ -22,4 +28,6 @@ __all__ = [
     "export_cell_panels",
     "load_annotations",
     "prepare_csde_inputs",
+    "read_annotations",
+    "ANNOTATION_ACTIONS",
 ]
