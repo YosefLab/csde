@@ -261,7 +261,9 @@ def prepare_csde_inputs(
         )
 
     adata_gt.obs["manual_action"] = actions
-    adata_gt.obs["manual_cell_type"] = manual_cell_type
+    adata_gt.obs["manual_cell_type"] = pd.Series(
+        manual_cell_type, index=adata_gt.obs_names, dtype=object
+    )
 
     # --- Annotation (GT) labels ---
     # The spatial group is always the automated one: manual curation revises the

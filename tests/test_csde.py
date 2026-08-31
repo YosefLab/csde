@@ -226,7 +226,7 @@ class TestPrepareCsdeInputs(unittest.TestCase):
         obs = self._run()["adata_gt"].obs
         self.assertEqual(obs.loc["c0", "manual_cell_type"], COI)  # accepted
         self.assertEqual(obs.loc["c3", "manual_cell_type"], "fibroblast")  # corrected
-        self.assertIsNone(obs.loc["c2", "manual_cell_type"])  # rejected
+        self.assertTrue(pd.isna(obs.loc["c2", "manual_cell_type"]))  # rejected
 
     def test_summary_counts(self):
         summary = self._run()["summary"]
